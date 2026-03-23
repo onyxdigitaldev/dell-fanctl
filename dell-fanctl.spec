@@ -7,6 +7,7 @@ URL:            https://github.com/onyxdigitaldev/dell-fanctl
 Source0:        %{name}-%{version}.tar.gz
 
 BuildArch:      noarch
+BuildRequires:  systemd-rpm-macros
 Requires:       python3 >= 3.10
 Recommends:     python3-gobject
 Recommends:     libappindicator-gtk3
@@ -60,5 +61,5 @@ done
 %{_sysconfdir}/xdg/autostart/dell-fanctl-tray.desktop
 
 %changelog
-* Sun Mar 23 2026 Onyx Digital <dev@onyxdigital.dev> - 1.0.0-1
+* Mon Mar 23 2026 Onyx Digital <dev@onyxdigital.dev> - 1.0.0-1
 - Initial release
