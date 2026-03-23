@@ -1,0 +1,11 @@
+#!/bin/bash
+set -e
+
+if [ "$1" = "configure" ]; then
+    if [ ! -f /etc/modprobe.d/dell-fan.conf ] || ! grep -q "restricted=0" /etc/modprobe.d/dell-fan.conf 2>/dev/null; then
+        mkdir -p /etc/modprobe.d
+        echo "options dell_smm_hwmon restricted=0 force=1" > /etc/modprobe.d/dell-fan.conf
+    fi
+fi
+
+#DEBHELPER#

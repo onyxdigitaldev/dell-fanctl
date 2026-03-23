@@ -1,0 +1,22 @@
+Source: dell-fanctl
+Section: utils
+Priority: optional
+Maintainer: Onyx Digital <dev@onyxdigital.dev>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Homepage: https://github.com/onyxdigitaldev/dell-fanctl
+Rules-Requires-Root: no
+
+Package: dell-fanctl
+Architecture: all
+Depends: ${misc:Depends}, python3 (>= 3.10)
+Recommends: python3-gi, gir1.2-appindicator3-0.1
+Description: Adaptive fan controller for Dell laptops
+ Automatically switches between quiet and gaming fan curves based on
+ CPU load and temperature. Uses dell_smm_hwmon for direct PWM control.
+ .
+ Features:
+  - Temperature-driven PWM curves with linear interpolation
+  - Asymmetric thresholds: fast ramp-up (12s), slow cooldown (30s)
+  - System tray applet with manual override
+  - Clean shutdown restores BIOS fan control

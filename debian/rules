@@ -1,0 +1,9 @@
+#!/usr/bin/make -f
+%:
+	dh $@
+
+override_dh_auto_install:
+	install -Dm 755 bin/dell-fanctl $(CURDIR)/debian/dell-fanctl/usr/bin/dell-fanctl
+	install -Dm 755 bin/dell-fanctl-tray $(CURDIR)/debian/dell-fanctl/usr/bin/dell-fanctl-tray
+	install -Dm 644 systemd/dell-fanctl.service $(CURDIR)/debian/dell-fanctl/lib/systemd/system/dell-fanctl.service
+	install -Dm 644 systemd/dell-fanctl-tray.desktop $(CURDIR)/debian/dell-fanctl/etc/xdg/autostart/dell-fanctl-tray.desktop
