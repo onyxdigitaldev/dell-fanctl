@@ -1,0 +1,12 @@
+[Unit]
+Description=Dell adaptive fan controller
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/dell-fanctl
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

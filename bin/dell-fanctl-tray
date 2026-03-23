@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""
+dell-fanctl-tray — System tray indicator for dell-fanctl
+
+Shows current fan profile state in the system tray:
+  Purple circle + Q = QUIET (balanced)
+  Blue circle + G   = GAMING (aggressive cooling)
+
+Uses AppIndicator3 + GTK3 — ships with most desktop Linux distros.
+Reads /tmp/dell-fanctl.state to determine profile.
+Writes /tmp/dell-fanctl.force for manual overrides.
+Polls every 5 seconds. Negligible overhead.
+
+Colors:
+  Purple: #7B2FBE
+  Blue:   #00A8E8
+"""
+
+import os
+import signal
+import tempfile
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("AppIndicator3", "0.1")
+from gi.repository import Gtk, GLib, AppIndicator3
+
+import cairo
+
+STATE_FILE = "/tmp/dell-fanctl.state"
+FORCE_FILE = "/tmp/dell-fanctl.force"
+
+COLOR_QUIET = (0.482, 0.184, 0.745)
+COLOR_GAMING = (0.0, 0.659, 0.910)
+
+
+def read_active_profile() -> str:
+    try:
+        with open(STATE_FILE) as f:
+            return f.read().strip()
+    except (FileNotFoundError, PermissionError):
+        return "quiet"
+
+
+def render_icon(color: tuple, letter: str, path: str) -> None:
+    size = 64
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
+    ctx = cairo.Context(surface)
+
+    ctx.arc(size / 2, size / 2, size / 2 - 2, 0, 2 * 3.14159)
+    ctx.set_source_rgb(*color)
+    ctx.fill()
+
+    ctx.set_source_rgb(1, 1, 1)
+    ctx.select_font_face("sans-serif", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+    ctx.set_font_size(36)
+    extents = ctx.text_extents(letter)
+    x = (size - extents.width) / 2 - extents.x_bearing
+    y = (size - extents.height) / 2 - extents.y_bearing
+    ctx.move_to(x, y)
+    ctx.show_text(letter)
+
+    surface.write_to_png(path)
+
+
+class FanTray:
+    def __init__(self):
+        self.state = "quiet"
+        self.icon_dir = tempfile.mkdtemp(prefix="dell-fanctl-")
+
+        self.icon_quiet = os.path.join(self.icon_dir, "quiet")
+        self.icon_gaming = os.path.join(self.icon_dir, "gaming")
+        render_icon(COLOR_QUIET, "Q", self.icon_quiet + ".png")
+        render_icon(COLOR_GAMING, "G", self.icon_gaming + ".png")
+
+        self.indicator = AppIndicator3.Indicator.new(
+            "dell-fanctl",
+            self.icon_quiet,
+            AppIndicator3.IndicatorCategory.HARDWARE,
+        )
+        self.indicator.set_icon_theme_path(self.icon_dir)
+        self.indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+        self.indicator.set_title("Dell Fan Control")
+
+        self._build_menu()
+
+        GLib.timeout_add_seconds(5, self._poll)
+        self._poll()
+
+    def _build_menu(self):
+        menu = Gtk.Menu()
+
+        self.status_item = Gtk.MenuItem(label="Profile: quiet")
+        self.status_item.set_sensitive(False)
+        menu.append(self.status_item)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        gaming_item = Gtk.MenuItem(label="Force Gaming")
+        gaming_item.connect("activate", self._force_gaming)
+        menu.append(gaming_item)
+
+        quiet_item = Gtk.MenuItem(label="Force Quiet")
+        quiet_item.connect("activate", self._force_quiet)
+        menu.append(quiet_item)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        quit_item = Gtk.MenuItem(label="Quit Tray")
+        quit_item.connect("activate", lambda _: Gtk.main_quit())
+        menu.append(quit_item)
+
+        menu.show_all()
+        self.indicator.set_menu(menu)
+
+    def _poll(self) -> bool:
+        profile = read_active_profile()
+        if profile != self.state:
+            self.state = profile
+            if profile == "gaming":
+                self.indicator.set_icon_full(self.icon_gaming, "GAMING")
+                self.status_item.set_label("Profile: GAMING")
+            else:
+                self.indicator.set_icon_full(self.icon_quiet, "quiet")
+                self.status_item.set_label("Profile: quiet")
+        return True
+
+    def _force_gaming(self, _widget):
+        try:
+            with open(FORCE_FILE, "w") as f:
+                f.write("gaming")
+        except OSError:
+            pass
+
+    def _force_quiet(self, _widget):
+        try:
+            with open(FORCE_FILE, "w") as f:
+                f.write("quiet")
+        except OSError:
+            pass
+
+
+def main():
+    signal.signal(signal.SIGINT, lambda *_: Gtk.main_quit())
+    signal.signal(signal.SIGTERM, lambda *_: Gtk.main_quit())
+
+    FanTray()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

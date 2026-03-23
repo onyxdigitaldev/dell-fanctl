@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""
+dell-fanctl — Adaptive fan controller for Dell laptops
+
+Monitors CPU utilization and adjusts fan speed via dell_smm_hwmon PWM.
+Zero dependencies beyond stdlib.
+
+Design principles:
+  - Reads /proc/stat directly — no external tools, no polling overhead
+  - Temperature-aware: reads coretemp + PWM curves for smooth fan ramp
+  - Hysteresis with asymmetric thresholds prevents profile thrashing
+  - Counter decay instead of hard reset absorbs transient spikes/dips
+  - Fast engagement (12s sustained), slow disengagement (30s sustained)
+  - Direct PWM writes to dell_smm_hwmon sysfs — no thinkfan needed
+  - Manual override via force file (one-shot, consumed on read)
+  - Clean shutdown restores BIOS auto fan control
+  - All state transitions logged to journald via stdout
+"""
+
+import signal
+import time
+from pathlib import Path
+
+# ── Thresholds ───────────────────────────────────────────
+#
+# ENTER: 4 consecutive samples above 55% = 12 seconds of sustained load
+# EXIT:  10 consecutive samples below 25% = 30 seconds of sustained idle
+#
+# The asymmetry is deliberate — ramp up fast to protect thermals,
+# ramp down slow to survive loading screens and brief pauses.
+
+SAMPLE_INTERVAL = 3
+
+GAMING_ENTER_THRESH = 55
+GAMING_ENTER_COUNT = 4
+
+GAMING_EXIT_THRESH = 25
+GAMING_EXIT_COUNT = 10
+
+# ── PWM Curves ───────────────────────────────────────────
+# (temp_celsius, pwm_value) — linear interpolation between points
+# PWM range: 0 = BIOS auto/off, 1-255 = manual speed
+#
+# Adjust these to match your laptop's thermal behavior.
+# Higher PWM = faster fan. Most Dell laptops map PWM to a few
+# discrete speed steps rather than linear RPM.
+
+CURVE_QUIET = [
+    (0,  0),
+    (50, 0),
+    (55, 64),
+    (60, 96),
+    (65, 128),
+    (70, 160),
+    (75, 192),
+    (80, 224),
+    (85, 255),
+]
+
+CURVE_GAMING = [
+    (0,  0),
+    (40, 64),
+    (48, 96),
+    (53, 128),
+    (60, 192),
+    (68, 224),
+    (72, 255),
+]
+
+# ── Paths ────────────────────────────────────────────────
+
+DELL_SMM_NAME = "dell_smm"
+STATE_FILE = Path("/tmp/dell-fanctl.state")
+FORCE_FILE = Path("/tmp/dell-fanctl.force")
+
+
+class Profile:
+    QUIET = "quiet"
+    GAMING = "gaming"
+
+
+def log(msg: str) -> None:
+    print(f"[dell-fanctl] {msg}", flush=True)
+
+
+def find_hwmon(name: str) -> Path | None:
+    """Find hwmon device by name, handles renumbering across boots."""
+    for hwmon in Path("/sys/class/hwmon").iterdir():
+        try:
+            if (hwmon / "name").read_text().strip() == name:
+                return hwmon
+        except (OSError, FileNotFoundError):
+            continue
+    return None
+
+
+def find_coretemp() -> Path | None:
+    """Find coretemp hwmon for CPU package temperature."""
+    return find_hwmon("coretemp")
+
+
+def read_pkg_temp(coretemp: Path) -> float:
+    """Read CPU package temperature (temp1 = Package id 0)."""
+    try:
+        return int((coretemp / "temp1_input").read_text().strip()) / 1000.0
+    except (OSError, ValueError):
+        return 0.0
+
+
+def write_pwm(dell_hwmon: Path, value: int) -> None:
+    """Write PWM value to dell_smm fan control."""
+    value = max(0, min(255, value))
+    try:
+        (dell_hwmon / "pwm1").write_text(str(value))
+    except (OSError, PermissionError) as e:
+        log(f"WARNING: PWM write failed: {e}")
+
+
+def interpolate_curve(curve: list[tuple[int, int]], temp: float) -> int:
+    """Linear interpolation along a temp-to-PWM curve."""
+    if temp <= curve[0][0]:
+        return curve[0][1]
+    if temp >= curve[-1][0]:
+        return curve[-1][1]
+
+    for i in range(len(curve) - 1):
+        t0, p0 = curve[i]
+        t1, p1 = curve[i + 1]
+        if t0 <= temp <= t1:
+            ratio = (temp - t0) / (t1 - t0)
+            return int(p0 + ratio * (p1 - p0))
+
+    return curve[-1][1]
+
+
+def read_cpu_ticks() -> tuple[int, int]:
+    """Read aggregate CPU jiffies from /proc/stat."""
+    with open("/proc/stat") as f:
+        line = f.readline()
+    parts = line.split()
+    ticks = [int(x) for x in parts[1:9]]
+    idle = ticks[3] + ticks[4]
+    total = sum(ticks)
+    return total - idle, total
+
+
+def cpu_percent(prev: tuple[int, int], curr: tuple[int, int]) -> float:
+    """CPU usage between two tick snapshots."""
+    d_active = curr[0] - prev[0]
+    d_total = curr[1] - prev[1]
+    if d_total == 0:
+        return 0.0
+    return (d_active / d_total) * 100.0
+
+
+def write_state(state: str) -> None:
+    """Write current state to file for tray applet to read."""
+    try:
+        STATE_FILE.write_text(state)
+    except OSError:
+        pass
+
+
+def read_force() -> str | None:
+    """Check if the tray applet has requested a forced profile switch.
+    Consumes the force file on read (one-shot)."""
+    try:
+        if FORCE_FILE.exists():
+            value = FORCE_FILE.read_text().strip()
+            FORCE_FILE.unlink()
+            if value in (Profile.QUIET, Profile.GAMING):
+                return value
+    except OSError:
+        pass
+    return None
+
+
+def main() -> None:
+    dell_hwmon = find_hwmon(DELL_SMM_NAME)
+    if not dell_hwmon:
+        log("ERROR: dell_smm hwmon not found")
+        return
+
+    coretemp = find_coretemp()
+    if not coretemp:
+        log("ERROR: coretemp hwmon not found")
+        return
+
+    log(f"Dell SMM at {dell_hwmon}, coretemp at {coretemp}")
+
+    state = Profile.QUIET
+    above = 0
+    below = 0
+    last_pwm = -1
+
+    prev = read_cpu_ticks()
+    time.sleep(SAMPLE_INTERVAL)
+
+    log(f"Started — profile: {state}, "
+        f"enter: {GAMING_ENTER_THRESH}% x{GAMING_ENTER_COUNT}, "
+        f"exit: {GAMING_EXIT_THRESH}% x{GAMING_EXIT_COUNT}")
+    write_state(state)
+
+    running = True
+
+    def shutdown(signum, _frame):
+        nonlocal running
+        log(f"Received {signal.Signals(signum).name}")
+        running = False
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    while running:
+        curr = read_cpu_ticks()
+        usage = cpu_percent(prev, curr)
+        prev = curr
+
+        temp = read_pkg_temp(coretemp)
+
+        # Check for manual override from tray applet
+        forced = read_force()
+        if forced and forced != state:
+            log(f"Manual override — switching to {forced.upper()}")
+            state = forced
+            write_state(state)
+            above = 0
+            below = 0
+
+        # Mode switching with hysteresis
+        if state == Profile.QUIET:
+            if usage >= GAMING_ENTER_THRESH:
+                above += 1
+                below = 0
+                if above >= GAMING_ENTER_COUNT:
+                    log(f"Sustained {usage:.0f}% CPU @ {temp:.0f}C — switching to GAMING")
+                    state = Profile.GAMING
+                    write_state(state)
+                    above = 0
+            else:
+                above = max(0, above - 1)
+
+        elif state == Profile.GAMING:
+            if usage <= GAMING_EXIT_THRESH:
+                below += 1
+                above = 0
+                if below >= GAMING_EXIT_COUNT:
+                    log(f"Dropped to {usage:.0f}% CPU @ {temp:.0f}C — switching to QUIET")
+                    state = Profile.QUIET
+                    write_state(state)
+                    below = 0
+            else:
+                below = max(0, below - 1)
+
+        # Apply PWM from active curve
+        curve = CURVE_GAMING if state == Profile.GAMING else CURVE_QUIET
+        target_pwm = interpolate_curve(curve, temp)
+
+        # Only write if PWM changed (reduce sysfs writes)
+        if target_pwm != last_pwm:
+            write_pwm(dell_hwmon, target_pwm)
+            last_pwm = target_pwm
+
+        try:
+            time.sleep(SAMPLE_INTERVAL)
+        except InterruptedError:
+            break
+
+    # Clean exit — return to BIOS auto
+    log("Restoring BIOS fan control")
+    write_pwm(dell_hwmon, 0)
+    write_state(Profile.QUIET)
+    log("Shutdown complete")
+
+
+if __name__ == "__main__":
+    main()

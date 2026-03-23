@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Dell Fan Monitor
+Exec=/usr/local/bin/dell-fanctl-tray
+Icon=preferences-desktop-fan-speed
+Comment=System tray indicator for Dell fan profile
+X-KDE-autostart-phase=2
+X-KDE-autostart-after=panel
+Terminal=false
+Categories=System;Monitor;
